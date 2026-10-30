@@ -10,12 +10,17 @@ import android.os.IBinder
 import com.zeeb.cachecleaner.BuildConfig
 import com.zeeb.cachecleaner.IShellService
 import com.zeeb.cachecleaner.service.ShellService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import rikka.shizuku.Shizuku
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 enum class ShizukuStatus {
     NOT_INSTALLED,
@@ -30,7 +35,7 @@ class ShizukuController(private val context: Context) {
     val status: StateFlow<ShizukuStatus> = _status.asStateFlow()
 
     private var currentService: IShellService? = null
-    private var isBound = false
+    private var activeConnection: ServiceConnection? = null
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         checkStatus()
@@ -38,17 +43,17 @@ class ShizukuController(private val context: Context) {
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         currentService = null
-        isBound = false
+        activeConnection = null
         checkStatus()
     }
 
     private val requestPermissionResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
             if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
-                if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                    _status.value = ShizukuStatus.READY
+                _status.value = if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                    ShizukuStatus.READY
                 } else {
-                    _status.value = ShizukuStatus.NO_PERMISSION
+                    ShizukuStatus.NO_PERMISSION
                 }
             }
         }
@@ -68,8 +73,7 @@ class ShizukuController(private val context: Context) {
     }
 
     fun checkStatus() {
-        val isInstalled = isShizukuInstalled()
-        if (!isInstalled) {
+        if (!isShizukuInstalled()) {
             _status.value = ShizukuStatus.NOT_INSTALLED
             return
         }
@@ -91,27 +95,24 @@ class ShizukuController(private val context: Context) {
             false
         }
 
-        if (hasPermission) {
-            _status.value = ShizukuStatus.READY
-        } else {
-            _status.value = ShizukuStatus.NO_PERMISSION
-        }
+        _status.value = if (hasPermission) ShizukuStatus.READY else ShizukuStatus.NO_PERMISSION
     }
 
     fun requestPermission() {
-        if (Shizuku.pingBinder()) {
-            Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+        try {
+            if (Shizuku.pingBinder()) {
+                Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+            }
+        } catch (_: Exception) {
         }
     }
 
     fun openShizukuApp() {
-        try {
-            val intent = context.packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
-            if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(intent)
-            }
-        } catch (e: Exception) {
+        val intent = context.packageManager.getLaunchIntentForPackage(SHIZUKU_PACKAGE)
+        if (intent != null) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        } else {
             openShizukuDownloadPage()
         }
     }
@@ -135,19 +136,17 @@ class ShizukuController(private val context: Context) {
         }
     }
 
-    /**
-     * Memanggil UserService Shizuku dan mengeksekusi shell command secara aman.
-     * Setelah eksekusi selesai atau gagal, service akan di-unbind otomatis.
-     */
     suspend fun executeCommand(cmd: String): Result<String> {
         if (_status.value != ShizukuStatus.READY) {
             return Result.failure(IllegalStateException("Shizuku belum siap: ${_status.value}"))
         }
-
         return try {
-            val service = getOrBindUserService()
-            val result = service.runCommand(cmd)
-            Result.success(result)
+            val service = withTimeout(10_000) {
+                withContext(Dispatchers.Main) { getOrBindUserService() }
+            }
+            Result.success(service.runCommand(cmd))
+        } catch (e: TimeoutCancellationException) {
+            Result.failure(IllegalStateException("Gagal terhubung ke layanan Shizuku (timeout)"))
         } catch (e: Exception) {
             Result.failure(e)
         } finally {
@@ -165,60 +164,36 @@ class ShizukuController(private val context: Context) {
             .version(BuildConfig.VERSION_CODE)
     }
 
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            currentService = IShellService.Stub.asInterface(service)
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            currentService = null
-            isBound = false
-        }
-    }
-
     private suspend fun getOrBindUserService(): IShellService {
         currentService?.let { return it }
-
-        return suspendCancellableCoroutine { continuation ->
-            val tempConnection = object : ServiceConnection {
-                override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                    val stub = IShellService.Stub.asInterface(service)
+        return suspendCancellableCoroutine { cont ->
+            val conn = object : ServiceConnection {
+                override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                    val stub = IShellService.Stub.asInterface(binder)
                     currentService = stub
-                    isBound = true
-                    if (continuation.isActive) {
-                        continuation.resume(stub)
-                    }
+                    if (cont.isActive) cont.resume(stub)
                 }
 
                 override fun onServiceDisconnected(name: ComponentName?) {
                     currentService = null
-                    isBound = false
                 }
             }
-
+            activeConnection = conn
             try {
-                Shizuku.bindUserService(userServiceArgs, tempConnection)
+                Shizuku.bindUserService(userServiceArgs, conn)
             } catch (e: Exception) {
-                if (continuation.isActive) {
-                    continuation.resumeWith(Result.failure(e))
-                }
+                if (cont.isActive) cont.resumeWithException(e)
             }
         }
     }
 
     private fun unbindService() {
-        if (isBound) {
-            try {
-                currentService?.destroy()
-            } catch (_: Exception) {}
-
-            try {
-                Shizuku.unbindUserService(userServiceArgs, serviceConnection, true)
-            } catch (_: Exception) {}
-
-            currentService = null
-            isBound = false
+        try { currentService?.destroy() } catch (_: Exception) {}
+        activeConnection?.let {
+            try { Shizuku.unbindUserService(userServiceArgs, it, true) } catch (_: Exception) {}
         }
+        activeConnection = null
+        currentService = null
     }
 
     companion object {
